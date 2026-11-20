@@ -243,3 +243,126 @@ def test_10_failed_commit_keeps_state_intact(client):
     r2 = client.post("/api/changes/commit", json=bad2)
     assert r2.status_code == 422
     assert client.get("/api/state").json()["current_version"] == before["current_version"]
+
+
+def test_11_plan_requires_current_base_version(client):
+    """预核验必须携带等于当前版本的 base_version，否则拒绝且不落库。"""
+    ver = client.get("/api/state").json()["current_version"]
+    txns_before = client.get("/api/txns").json()["txns"]
+
+    # 过期版本（草案所用地籍已换版）→ 409
+    stale = change_req(ver - 1, ["P2"], [("Z9", P2_RING)])
+    r = client.post("/api/changes/plan", json=stale)
+    assert r.status_code == 409 and "重新核验" in r.json()["detail"]
+    # 未来版本 → 409
+    future = change_req(ver + 1, ["P2"], [("Z9", P2_RING)])
+    assert client.post("/api/changes/plan", json=future).status_code == 409
+    # 缺 base_version / 非整数 → 422
+    missing = change_req(ver, ["P2"], [("Z9", P2_RING)])
+    del missing["base_version"]
+    assert client.post("/api/changes/plan", json=missing).status_code == 422
+    assert client.post("/api/changes/plan", json=change_req("v", ["P2"], [("Z9", P2_RING)])).status_code == 422
+    assert client.post("/api/changes/plan", json=change_req(True, ["P2"], [("Z9", P2_RING)])).status_code == 422
+
+    # 当前版本 → 正常核验，报告与底图同版
+    ok = client.post("/api/changes/plan", json=change_req(ver, ["P2"], [("Z9", P2_RING)]))
+    assert ok.status_code == 200 and ok.json()["base_version"] == ver
+
+    # 被拒的核验不写入任何数据
+    state = client.get("/api/state").json()
+    assert state["current_version"] == ver
+    assert client.get("/api/txns").json()["txns"] == txns_before
+
+
+def test_12_rejected_commit_writes_nothing(client):
+    """被拒的提交（409 换版 / 422 核验未过）不得写入现势、历史或流水。"""
+    before = client.get("/api/state").json()
+    txns_before = client.get("/api/txns").json()["txns"]
+    ver = before["current_version"]
+
+    # 版本过期 → 409
+    stale = change_req(ver - 1, ["P2"], [("Z9", P2_RING)])
+    r = client.post("/api/changes/commit", json=stale)
+    assert r.status_code == 409
+    # 核验未通过（新面只盖住 P2 左半，存在缺口）→ 422
+    gap = change_req(ver, ["P2"], [("Z9", [[10, 0], [15, 0], [15, 10], [10, 10], [10, 0]])])
+    r2 = client.post("/api/changes/commit", json=gap)
+    assert r2.status_code == 422
+
+    after = client.get("/api/state").json()
+    assert after == before                                   # 现势未动
+    assert client.get("/api/txns").json()["txns"] == txns_before  # 流水未动
+    for p in before["parcels"]:                              # 历史未新增版本行
+        h = client.get(f"/api/history/parcel/{p['parcel_id']}").json()
+        assert max(v["version"] for v in h["versions"]) <= ver
+
+
+def test_13_stale_draft_rejected_then_replan_and_commit(client):
+    """另一窗口先提交（换版）后：旧草案核验与确认都被拒；刷新重核可再提交。"""
+    ver = client.get("/api/state").json()["current_version"]
+    # 窗口 B 基于当前版本起草：退出 P2，新设 Z9（同范围）
+    draft = change_req(ver, ["P2"], [("Z9", P2_RING)], reason="B 的草案")
+    plan = client.post("/api/changes/plan", json=draft)
+    assert plan.status_code == 200 and plan.json()["valid"] is True
+
+    # 窗口 A 抢先提交另一笔变更（P2 改名 P2X）→ 地籍换版
+    other = change_req(ver, ["P2"], [("P2X", P2_RING)], reason="A 抢先")
+    r = client.post("/api/changes/commit", json=other)
+    assert r.status_code == 200 and r.json()["new_version"] == ver + 1
+
+    # B 的旧草案：核验与确认都必须拒绝（409），且不写入任何数据
+    txns_before = client.get("/api/txns").json()["txns"]
+    assert client.post("/api/changes/plan", json=draft).status_code == 409
+    assert client.post("/api/changes/commit", json=draft).status_code == 409
+    assert client.get("/api/txns").json()["txns"] == txns_before
+    assert client.get("/api/state").json()["current_version"] == ver + 1
+
+    # 刷新后重核：旧草案内容在新版下不成立（P2 已退出）→ 422，草案内容本身被指出问题
+    ver2 = ver + 1
+    assert client.post("/api/changes/plan", json=change_req(ver2, ["P2"], [("Z9", P2_RING)])).status_code == 422
+    # 按新底图修正草案（退出 P2X）→ 核验通过且与底图同版 → 确认成功
+    fixed = change_req(ver2, ["P2X"], [("Z9", P2_RING)], reason="B 重核后提交")
+    plan2 = client.post("/api/changes/plan", json=fixed)
+    assert plan2.status_code == 200 and plan2.json()["valid"] is True
+    assert plan2.json()["base_version"] == ver2
+    r2 = client.post("/api/changes/commit", json=fixed)
+    assert r2.status_code == 200 and r2.json()["new_version"] == ver2 + 1
+    ids = [p["parcel_id"] for p in client.get("/api/state").json()["parcels"]]
+    assert "Z9" in ids and "P2X" not in ids
+
+
+def test_14_plan_racing_commit_never_sees_mixed_state(client):
+    """核验与提交并发：核验要么基于旧版成功，要么 409，不得出错或读到混合状态。"""
+    ver = client.get("/api/state").json()["current_version"]
+    plan_req = change_req(ver, ["Z9"], [("Z9A", [[10, 0], [15, 0], [15, 10], [10, 10], [10, 0]]),
+                                      ("Z9B", [[15, 0], [20, 0], [20, 10], [15, 10], [15, 0]])])
+    commit_req = change_req(ver, ["Z9"], [("Z9C", P2_RING)])
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def do_plan():
+        barrier.wait()
+        with TestClient(app) as local:
+            r = local.post("/api/changes/plan", json=plan_req)
+            results["plan"] = (r.status_code, r.json())
+
+    def do_commit():
+        barrier.wait()
+        with TestClient(app) as local:
+            results["commit"] = local.post("/api/changes/commit", json=commit_req).status_code
+
+    t1 = threading.Thread(target=do_plan)
+    t2 = threading.Thread(target=do_commit)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert results["commit"] == 200
+    status, body = results["plan"]
+    if status == 200:  # 核验在提交前读到旧版快照：报告版本必须等于当时的底图版本
+        assert body["base_version"] == ver
+    else:              # 否则必须因换版被拒，而不是 500 或混合状态
+        assert status == 409
+    # 最终状态一致：只有提交那一笔生效
+    state = client.get("/api/state").json()
+    assert state["current_version"] == ver + 1
+    assert sorted(p["parcel_id"] for p in state["parcels"] if p["parcel_id"].startswith("Z9")) == ["Z9C"]

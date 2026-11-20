@@ -81,7 +81,7 @@
       <button class="action" onclick="doPlan()">预核验并预览缺口 / 侵占</button>
       <div id="planMsg"></div>
       <div id="planSummary"></div>
-      <button class="action ok hidden" id="commitBtn" onclick="doCommit()">确认提交（原子写入）</button>
+      <button class="action ok hidden" id="commitBtn" onclick="doCommit()">确认提交（仅提交已核验且未改动的草案）</button>
     </section>
 
     <!-- 查询 -->
@@ -123,8 +123,11 @@
 
 <script>
 const SVG_NS = "http://www.w3.org/2000/svg";
-let state = { version: 0, parcels: [] };
+let state = { current_version: 0, parcels: [] };
+// lastPlan：页面上「已核验且未改动」的草案 { signature, req, report }；
+// planSeq：核验请求序号，单调递增，用于识别并丢弃迟到的核验响应。
 let lastPlan = null;
+let planSeq = 0;
 
 function showTab(name) {
   for (const t of ["Import", "Change", "Query"]) {
@@ -142,7 +145,11 @@ function setMsg(id, cls, text) {
 async function api(path, opts) {
   const resp = await fetch(path, opts);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+  if (!resp.ok) {
+    const err = new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+    err.status = resp.status;
+    throw err;
+  }
   return data;
 }
 
@@ -151,6 +158,10 @@ async function refreshState() {
   state = data;
   document.getElementById("versionLabel").textContent = "当前版本：v" + data.current_version + "　宗地数：" + data.parcel_count;
   document.getElementById("baseVerHint").textContent = "提交基准版本 base_version = " + data.current_version + "（自动携带）";
+  // 底图换版后，旧版上的核验结果与确认资格一并失效（底图与核验报告须同版）
+  if (lastPlan && lastPlan.report.base_version !== data.current_version) {
+    invalidatePlan(`地籍已换版（v${lastPlan.report.base_version} → v${data.current_version}），原核验结果已失效，请重新核验。`);
+  }
   renderMap();
 }
 
@@ -259,64 +270,137 @@ function readChangeRequest() {
   };
 }
 
+// 草案签名：退出宗地 + 新宗地 + 变更原因的原始输入，任何一处改动都会改变签名
+function draftSignature() {
+  return document.getElementById("retiredIds").value + "" +
+         document.getElementById("newParcelsText").value + "" +
+         document.getElementById("reasonText").value;
+}
+
+// 使当前核验结果与确认资格失效：编辑草案、地籍换版、重新发起核验时调用。
+// planSeq 递增后，此前发出的核验响应一律视为迟到响应被丢弃。
+function invalidatePlan(msg) {
+  lastPlan = null;
+  planSeq++;
+  document.getElementById("commitBtn").classList.add("hidden");
+  document.getElementById("planSummary").innerHTML = "";
+  if (msg) setMsg("planMsg", "warn", msg);
+}
+
+// 编辑退出宗地、新宗地或变更原因后必须重新核验
+function onDraftEdit() {
+  const hadPlan = !!lastPlan;
+  invalidatePlan(hadPlan ? "草案已修改，原核验结果与确认资格已失效，请重新预核验。" : null);
+  if (hadPlan) renderMap();  // 清除不再对应该草案的叠加层
+}
+
 function issueFeatures(items, color, stroke, labelKey) {
   return { color, stroke, opacity: 0.6, features: items.map(it => ({ geometry: it.geometry, label: it[labelKey] || "" })) };
 }
 
+function renderPlanOverlays(req, report) {
+  const overlays = [];
+  // 退出旧面
+  const oldFeats = state.parcels.filter(p => req.retired_ids.includes(p.parcel_id))
+    .map(p => ({ geometry: p.geometry, label: p.parcel_id }));
+  overlays.push({ color: "#f5c6c0", stroke: "#c0392b", opacity: 0.35, features: oldFeats });
+  // 新面
+  overlays.push({ color: "#c8e6c9", stroke: "#2e7d32", opacity: 0.45, features: req.new_parcels.map(p => ({ geometry: p.geometry, label: p.parcel_id })) });
+  if (report.gaps.length) overlays.push(issueFeatures(report.gaps, "#e53935", "#b71c1c", "kind"));
+  if (report.encroachments.length) overlays.push(issueFeatures(report.encroachments, "#fb8c00", "#e65100", "kind"));
+  if (report.excess.length) overlays.push(issueFeatures(report.excess, "#8e24aa", "#6a1b9a", "kind"));
+  if (report.internal_overlaps.length) overlays.push(issueFeatures(report.internal_overlaps, "#d81b60", "#880e4f", "kind"));
+  renderMap(overlays);
+}
+
+function renderPlanSummary(report) {
+  const pills = [];
+  const cnt = (arr, cls, name) => arr.length ? `<span class="pill ${cls}">${name} ${arr.length} 处</span>` : "";
+  pills.push(cnt(report.gaps, "gap", "缺口"));
+  pills.push(cnt(report.encroachments, "enc", "侵占"));
+  pills.push(cnt(report.excess, "exc", "越界"));
+  pills.push(cnt(report.internal_overlaps, "ovl", "互叠"));
+  document.getElementById("planSummary").innerHTML =
+    `<div style="margin:8px 0">${pills.join(" ") || '<span class="pill" style="background:#eaf6ec;color:#1e6b29">全部核验通过</span>'}</div>` +
+    `<table><tr><th>退出旧面总面积</th><td>${report.retired_union_area}</td></tr>` +
+    `<tr><th>新面总面积</th><td>${report.new_union_area}</td></tr>` +
+    `<tr><th>核验基准版本</th><td>v${report.base_version}</td></tr></table>` +
+    (report.errors.length ? `<div class="msg err" style="margin-top:8px">${report.errors.join("\n")}</div>` : "");
+}
+
 async function doPlan() {
   setMsg("planMsg", "");
-  document.getElementById("planSummary").innerHTML = "";
-  document.getElementById("commitBtn").classList.add("hidden");
-  lastPlan = null;
+  // 先对齐底图与服务器现势，保证底图与核验报告对应同一版地籍
+  try { await refreshState(); }
+  catch (e) { return setMsg("planMsg", "err", "刷新现势底图失败：" + e.message); }
+
   let req;
   try { req = readChangeRequest(); } catch (e) { return setMsg("planMsg", "err", e.message); }
+
+  invalidatePlan(null);                  // 旧核验结果与确认资格作废
+  const seq = planSeq;                   // 本次核验序号
+  const signature = draftSignature();    // 发出请求时的草案内容
+  setMsg("planMsg", "", "核验中…");
   try {
     const report = await api("/api/changes/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(req) });
-    lastPlan = { req, report };
-    const overlays = [];
-    // 退出旧面
-    const oldFeats = state.parcels.filter(p => req.retired_ids.includes(p.parcel_id))
-      .map(p => ({ geometry: p.geometry, label: p.parcel_id }));
-    overlays.push({ color: "#f5c6c0", stroke: "#c0392b", opacity: 0.35, features: oldFeats });
-    // 新面
-    overlays.push({ color: "#c8e6c9", stroke: "#2e7d32", opacity: 0.45, features: req.new_parcels.map(p => ({ geometry: p.geometry, label: p.parcel_id })) });
-    if (report.gaps.length) overlays.push(issueFeatures(report.gaps, "#e53935", "#b71c1c", "kind"));
-    if (report.encroachments.length) overlays.push(issueFeatures(report.encroachments, "#fb8c00", "#e65100", "kind"));
-    if (report.excess.length) overlays.push(issueFeatures(report.excess, "#8e24aa", "#6a1b9a", "kind"));
-    if (report.internal_overlaps.length) overlays.push(issueFeatures(report.internal_overlaps, "#d81b60", "#880e4f", "kind"));
-    renderMap(overlays);
-
-    const pills = [];
-    const cnt = (arr, cls, name) => arr.length ? `<span class="pill ${cls}">${name} ${arr.length} 处</span>` : "";
-    pills.push(cnt(report.gaps, "gap", "缺口"));
-    pills.push(cnt(report.encroachments, "enc", "侵占"));
-    pills.push(cnt(report.excess, "exc", "越界"));
-    pills.push(cnt(report.internal_overlaps, "ovl", "互叠"));
-    document.getElementById("planSummary").innerHTML =
-      `<div style="margin:8px 0">${pills.join(" ") || '<span class="pill" style="background:#eaf6ec;color:#1e6b29">全部核验通过</span>'}</div>` +
-      `<table><tr><th>退出旧面总面积</th><td>${report.retired_union_area}</td></tr>` +
-      `<tr><th>新面总面积</th><td>${report.new_union_area}</td></tr></table>` +
-      (report.errors.length ? `<div class="msg err" style="margin-top:8px">${report.errors.join("\n")}</div>` : "");
+    // 迟到的响应：期间已发起更新的核验或草案被编辑 → 直接丢弃，
+    // 不得覆盖新结果，也不得恢复已失效的确认
+    if (seq !== planSeq || signature !== draftSignature()) return;
+    if (report.base_version !== state.current_version) {
+      await refreshState();
+      invalidatePlan(`底图已换版，该核验基于 v${report.base_version}，与当前底图不一致，请重新核验。`);
+      return;
+    }
+    lastPlan = { signature, req, report };
+    renderPlanOverlays(req, report);
+    renderPlanSummary(report);
     if (report.valid) {
-      setMsg("planMsg", "ok", "预核验通过：新面恰好覆盖退出旧面，无缺口、侵占与重叠。可确认提交。");
+      setMsg("planMsg", "ok", `预核验通过（基于 v${report.base_version}）：新面恰好覆盖退出旧面，无缺口、侵占与重叠。可确认提交。`);
       document.getElementById("commitBtn").classList.remove("hidden");
     } else {
       setMsg("planMsg", "warn", "预核验未通过，图中红色/橙色/紫色区域为问题位置；修改后重新核验。");
     }
-  } catch (e) { setMsg("planMsg", "err", e.message); renderMap(); }
+  } catch (e) {
+    if (seq !== planSeq || signature !== draftSignature()) return;  // 迟到的错误同样丢弃
+    if (e.status === 409) {
+      // 草案所用地籍已换版：核验被拒绝，草案保留，刷新底图后需重新核验
+      try { await refreshState(); } catch (_) {}
+      setMsg("planMsg", "warn", e.message + "\n草案已保留，底图已刷新到最新地籍版本，请核对后重新核验。");
+    } else {
+      setMsg("planMsg", "err", e.message);
+      renderMap();
+    }
+  }
 }
 
 async function doCommit() {
-  if (!lastPlan) return;
+  // 确认只可提交「页面上已核验通过且未改动」的草案
+  if (!lastPlan || !lastPlan.report.valid) return;
+  if (draftSignature() !== lastPlan.signature) {
+    invalidatePlan("草案已修改，与已核验内容不一致，请重新预核验。");
+    renderMap();
+    return;
+  }
+  const btn = document.getElementById("commitBtn");
+  btn.disabled = true;
   try {
     const r = await api("/api/changes/commit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(lastPlan.req) });
-    setMsg("planMsg", "ok", `提交成功：v${r.base_version} → v${r.new_version}，流水号 #${r.txn_id}\n退出：${r.retired_ids.join(", ")}\n新设：${r.new_ids.join(", ")}`);
-    document.getElementById("commitBtn").classList.add("hidden");
     lastPlan = null;
+    document.getElementById("commitBtn").classList.add("hidden");
+    document.getElementById("planSummary").innerHTML = "";
+    setMsg("planMsg", "ok", `提交成功：v${r.base_version} → v${r.new_version}，流水号 #${r.txn_id}\n退出：${r.retired_ids.join(", ")}\n新设：${r.new_ids.join(", ")}`);
     await refreshState();
   } catch (e) {
-    setMsg("planMsg", "err", e.message + "\n（现势与历史数据保持原状）");
-    await refreshState();
+    // 被拒的提交不写入现势、历史或流水；草案保留，但确认资格失效，须重新核验
+    invalidatePlan(null);
+    try { await refreshState(); } catch (_) {}
+    if (e.status === 409) {
+      setMsg("planMsg", "warn", e.message + "\n提交未写入任何数据。草案已保留，底图已刷新，请重新核验后再确认。");
+    } else {
+      setMsg("planMsg", "err", e.message + "\n（现势、历史与流水均保持原状；草案已保留，请重新核验）");
+    }
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -366,6 +450,11 @@ async function loadTxn(id) {
     renderMap([{ color: "#f5c6c0", stroke: "#c0392b", features: r.items.filter(i => i.role === "retired").map(i => ({ geometry: i.geometry, label: i.parcel_id })) },
               { color: "#c8e6c9", stroke: "#2e7d32", features: r.items.filter(i => i.role === "new").map(i => ({ geometry: i.geometry, label: i.parcel_id })) }]);
   } catch (e) { document.getElementById("txnDetail").innerHTML = `<div class="msg err">${e.message}</div>`; }
+}
+
+// 编辑退出宗地、新宗地或变更原因后，原核验结果与确认资格立即失效
+for (const id of ["retiredIds", "newParcelsText", "reasonText"]) {
+  document.getElementById(id).addEventListener("input", onDraftEdit);
 }
 
 refreshState().catch(() => {});

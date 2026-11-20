@@ -264,9 +264,28 @@ def _parse_change_request(req: dict) -> tuple[list[str], list[tuple[str, Any]]]:
 
 
 def plan(conn: sqlite3.Connection, req: dict) -> dict:
-    """预核验：不落库，返回缺口/侵占/越界/重叠明细供网页预览。"""
+    """预核验：不落库，返回缺口/侵占/越界/重叠明细供网页预览。
+
+    base_version 必须等于当前地籍版本：核验报告只对请求方底图那一版负责，
+    草案所用地籍已换版时拒绝核验（409），提示刷新后重核。版本号与现势几何
+    在同一读事务快照内取出，避免与并发提交交错读到混合状态。
+    """
     retired_ids, new_items = _parse_change_request(req)
-    current = _current_geoms(conn)
+    base_version = req.get("base_version")
+    if not isinstance(base_version, int) or isinstance(base_version, bool):
+        raise GeoValidationError("base_version 必须是整数")
+
+    conn.execute("BEGIN")  # 读事务：版本号与现势几何取自同一快照
+    try:
+        ver = current_version(conn)
+        if ver != base_version:
+            raise VersionConflictError(
+                f"版本冲突：草案基于 v{base_version}，当前地籍已是 v{ver}，"
+                "核验未执行，请刷新底图后重新核验"
+            )
+        current = _current_geoms(conn)
+    finally:
+        conn.rollback()  # 预核验不落库，仅释放读快照
 
     missing = [pid for pid in retired_ids if pid not in current]
     if missing:
@@ -281,7 +300,7 @@ def plan(conn: sqlite3.Connection, req: dict) -> dict:
     surviving = [(pid, g) for pid, g in current.items() if pid not in set(retired_ids)]
     report = plan_change(retired, new_items, surviving)
     return {
-        "base_version": current_version(conn),
+        "base_version": ver,
         "retired_ids": retired_ids,
         "new_ids": [nid for nid, _ in new_items],
         **report.to_dict(),

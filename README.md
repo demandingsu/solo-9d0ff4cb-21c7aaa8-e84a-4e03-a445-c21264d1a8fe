@@ -31,7 +31,11 @@ CADASTRE_DB=./data/cadastre.db uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 新宗地号不得与现势宗地号冲突。
 3. **两阶段操作**：先 `POST /api/changes/plan` 预核验，返回缺口/侵占/越界/互叠的
    GeoJSON 几何，网页在 SVG 地图上以红/橙/紫/粉色叠加预览；核验通过后才能
-   `POST /api/changes/commit` 确认。
+   `POST /api/changes/commit` 确认。核验与确认都携带 `base_version`：草案所基于的
+   地籍一旦换版，两者都拒绝（409），网页保留草案并刷新底图，提示重新核验；
+   核验报告与页面底图始终对应同一版地籍。网页端编辑退出宗地、新宗地或变更原因后，
+   原核验结果与确认资格立即失效，须重新预核验；确认只提交页面上已核验通过且
+   未改动的草案，迟到的核验响应不会覆盖新结果或恢复已失效的确认。
 4. **乐观并发**：每个请求携带 `base_version`。提交在 `BEGIN IMMEDIATE` 事务内复核
    当前版本，版本不一致返回 409。基于同一版本的两笔提交只有一笔生效。
 5. **失败原子性**：任何核验或写入失败都回滚整个事务，现势与历史保持原状。
@@ -44,7 +48,7 @@ CADASTRE_DB=./data/cadastre.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | GET | `/api/state` | 当前版本与全部现势宗地 |
 | POST | `/api/import` | 初始导入 GeoJSON |
-| POST | `/api/changes/plan` | 预核验（不落库），返回问题区域几何 |
+| POST | `/api/changes/plan` | 预核验（不落库），返回问题区域几何；`base_version` 过期返回 409 |
 | POST | `/api/changes/commit` | 确认提交（原子写入，版本冲突返回 409） |
 | GET | `/api/history/parcel/{id}` | 单宗地全历史版本边界 |
 | GET | `/api/history/version/{v}` | 截至 v 版本的现势快照 |
@@ -67,4 +71,5 @@ pytest -v
 
 覆盖：导入校验（非整数/带洞/重叠/重复导入）、缺口与侵占预核验、预核验不落库、
 非法提交被拒且数据不变、拆分、合并、历史与版本快照、多线程竞争提交（200+409）、
-失败回滚。
+失败回滚、预核验版本检查（过期 409 / 缺号 422）、被拒提交不写现势/历史/流水、
+换版后旧草案核验与确认双拒并重核成功、核验与提交并发不读混合状态。
